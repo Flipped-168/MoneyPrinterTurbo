@@ -201,10 +201,22 @@ def _plain_config_value(text: str, key: str) -> str:
 def _replace_config_value(text: str, key: str, value: object) -> str:
     """Replace one active field while preserving the configuration layout."""
     pattern = re.compile(rf"(?m)^({re.escape(key)}\s*=\s*).*$")
-    if not pattern.search(text):
+    match = pattern.search(text)
+    if match is None:
         raise SkillError(f"configuration field not found in config.toml: {key}")
+    value_start = match.start() + len(match.group(1))
+    value_end = match.end()
+    while True:
+        try:
+            tomllib.loads("replacement = " + text[value_start:value_end])
+            break
+        except tomllib.TOMLDecodeError as exc:
+            next_line = text.find("\n", value_end + 1)
+            if value_end == len(text):
+                raise SkillError("configuration field is not valid TOML") from exc
+            value_end = len(text) if next_line < 0 else next_line
     encoded = json.dumps(value, ensure_ascii=False)
-    return pattern.sub(lambda match: f"{match.group(1)}{encoded}", text, count=1)
+    return text[:value_start] + encoded + text[value_end:]
 
 
 def _has_configured_value(value: str) -> bool:
@@ -262,7 +274,7 @@ def apply_environment_config(config_path: Path) -> None:
         return
 
     text = config_path.read_text(encoding="utf-8")
-    current_provider = _plain_config_value(text, "llm_provider") or "moonshot"
+    current_provider = (_plain_config_value(text, "llm_provider") or "moonshot").lower()
     provider = provider or current_provider
     changes: list[str] = []
     if os.environ.get("MPT_LLM_PROVIDER", "").strip():
@@ -332,7 +344,7 @@ def reuse_existing_llm_provider(config_path: Path) -> str:
     values are inspected in memory and are never logged.
     """
     text = config_path.read_text(encoding="utf-8")
-    current_provider = _plain_config_value(text, "llm_provider") or "moonshot"
+    current_provider = (_plain_config_value(text, "llm_provider") or "moonshot").lower()
     if _provider_is_ready(text, current_provider):
         return current_provider
 
@@ -368,7 +380,7 @@ def has_cli_option(cli_args: list[str], option: str) -> bool:
 def missing_config(config_path: Path, cli_args: list[str]) -> tuple[str, list[str]]:
     """Return the active provider and only the fields required by this run."""
     text = config_path.read_text(encoding="utf-8")
-    provider = _plain_config_value(text, "llm_provider") or "moonshot"
+    provider = (_plain_config_value(text, "llm_provider") or "moonshot").lower()
     missing: list[str] = []
     if provider not in KEYLESS_LLM_PROVIDERS and not _has_configured_value(
         _plain_config_value(text, f"{provider}_api_key")
