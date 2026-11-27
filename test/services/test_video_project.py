@@ -1,15 +1,18 @@
 """Native FFmpeg scenarios plus deterministic storage/lifecycle checks."""
 
 import copy
+from collections import Counter
 import json
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
+from app.services import video_project
 from app.services.video_project import (
     ProjectError,
     RenderCancelled,
@@ -19,6 +22,10 @@ from app.services.video_project import (
     main,
     stage_graph,
 )
+
+# A child command that never finishes on its own; the test only ends it
+# through the project's deadline or cancellation handling.
+HANGING_COMMAND = [sys.executable, "-c", "import time; time.sleep(60)"]
 
 
 def _media(arguments):
@@ -112,8 +119,8 @@ def _duration(path):
     )
 
 
-def _pixel(path, second):
-    raw = subprocess.check_output(
+def _frame(path, second):
+    return subprocess.check_output(
         [
             "ffmpeg",
             "-v",
@@ -131,7 +138,10 @@ def _pixel(path, second):
             "-",
         ]
     )
-    return tuple(raw[:3])
+
+
+def _pixel(path, second):
+    return tuple(_frame(path, second)[:3])
 
 
 def _audio(path):
@@ -211,6 +221,26 @@ def test_three_native_revision_scenarios(native):
     assert original["project_id"] == mixed["project_id"]
 
 
+def test_cached_render_verifies_each_artifact_once(native, monkeypatch):
+    project, _, _, _ = native
+    original = project.render()
+    verified = Counter()
+    digest = video_project._digest
+
+    def count_artifact_digest(path):
+        if path.is_relative_to(project.directory / "artifacts"):
+            verified[path] += 1
+        return digest(path)
+
+    monkeypatch.setattr(video_project, "_digest", count_artifact_digest)
+    reused = project.render()
+
+    assert reused["export"] == original["export"]
+    assert all(stage["reused"] for stage in reused["stages"].values())
+    assert len(verified) == len(reused["stages"])
+    assert set(verified.values()) == {1}
+
+
 def test_integrity_and_source_snapshot(native):
     project, request, revision, root = native
     project.render()
@@ -228,6 +258,8 @@ def test_integrity_and_source_snapshot(native):
     asset.write_bytes(b"source damage")
     with pytest.raises(ProjectError, match="source snapshot"):
         project.plan()
+    with pytest.raises(ProjectError, match="source snapshot"):
+        project.render()
 
 
 def test_failed_retry_and_last_success(native):
@@ -255,12 +287,18 @@ def test_cancel_then_explicit_retry(native):
 
     with pytest.raises(RenderCancelled):
         project.render(on_stage=cancel_scene)
-    assert project.status()["state"] == "cancelled"
+    cancelled = project.status()
+    assert cancelled["state"] == "cancelled"
+    assert cancelled["failed_stage"] == "opening:scene"
     assert project.metadata()["last_successful_export"] is None
     with pytest.raises(ProjectError, match="explicit --retry"):
         project.render()
-    assert project.render(retry=True)["state"] == "succeeded"
-    assert project.status()["stages"]["opening:audio"]["reused"]
+    retried = project.render(retry=True)
+    assert retried["state"] == "succeeded"
+    assert "failed_stage" not in retried
+    status = project.status()
+    assert "failed_stage" not in status
+    assert status["stages"]["opening:audio"]["reused"]
 
 
 def test_stale_revision_cannot_promote(native):
@@ -375,16 +413,13 @@ project.render(on_stage=crash)
 
 
 def test_command_deadline_and_active_cancellation(tmp_path):
-    import sys
     import time
 
     project = VideoProject(tmp_path)
     cancellation = tmp_path / "cancel.json"
     before = time.monotonic()
     with pytest.raises(ProjectError, match="deadline"):
-        project._run(
-            [sys.executable, "-c", "import time; time.sleep(60)"], cancellation, 0.15
-        )
+        project._run(HANGING_COMMAND, cancellation, 0.15)
     assert time.monotonic() - before < 3
     timer = threading.Timer(
         0.15, lambda: _atomic_json(cancellation, {"cancelled": True})
@@ -392,9 +427,7 @@ def test_command_deadline_and_active_cancellation(tmp_path):
     timer.start()
     try:
         with pytest.raises(RenderCancelled):
-            project._run(
-                [sys.executable, "-c", "import time; time.sleep(60)"], cancellation, 30
-            )
+            project._run(HANGING_COMMAND, cancellation, 30)
     finally:
         timer.join(timeout=3)
 
@@ -420,6 +453,41 @@ def test_cli_native_render(native):
     report = json.loads(completed.stdout)
     assert report["state"] == "succeeded"
     assert Path(report["export"]["path"]).is_file()
+    assert [clip["scene_id"] for clip in report["scene_clips"]] == [
+        "opening",
+        "closing",
+    ]
+    for clip in report["scene_clips"]:
+        scene_id = clip["scene_id"]
+        assert Path(clip["path"]).is_file()
+        assert clip["sha256"] == report["stages"][f"{scene_id}:scene"]["sha256"]
+    assert _pixel(report["scene_clips"][0]["path"], 0.2)[0] > 200
+    assert _pixel(report["scene_clips"][1]["path"], 0.2)[2] > 200
+
+
+@pytest.mark.parametrize(
+    "sar,box",
+    [("2/1", "x=24:y=16:w=16:h=32"), ("1/2", "x=16:y=24:w=32:h=16")],
+)
+def test_scene_cover_preserves_display_aspect_ratio(native, sar, box):
+    project, request, _, root = native
+    source = root / "anamorphic.mp4"
+    _media(
+        [
+            "-f", "lavfi",
+            "-i", f"color=black:s=64x64:r=10:d=0.6,drawbox={box}:color=red:t=fill,setsar={sar}",
+            "-c:v", "libx264", str(source),
+        ]
+    )
+    request["scenes"][0]["footage"] = source.name
+    project.create_revision(request, relative_to=root)
+
+    scene = project.render()["scene_clips"][0]["path"]
+    frame = _frame(scene, 0.2)
+    assert len(frame) == 64 * 64 * 3
+    red_pixels = [(i % 64, i // 64) for i, red in enumerate(frame[::3]) if red > 180]
+    xs, ys = zip(*red_pixels)
+    assert (min(xs), min(ys), max(xs), max(ys)) == (16, 16, 47, 47)
 
 
 def test_order_and_render_settings_invalidation(native):

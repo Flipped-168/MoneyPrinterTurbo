@@ -1009,6 +1009,98 @@ class TestMaterialTlsVerification(unittest.TestCase):
             self.assertEqual(get.call_count, 2)
             self.assertEqual((Path(temp_dir) / cached_name).read_bytes(), b"valid")
 
+    def test_corrupt_existing_cache_is_redownloaded_and_replaced(self):
+        """A stale nonempty cache entry must repair itself on the next request."""
+        url = "https://example.com/corrupt-cache.mp4"
+        cached_name = f"vid-{material.utils.md5(url)}.mp4"
+
+        class FakeVideoFileClip:
+            fps = 24
+
+            def __init__(self, path):
+                self.duration = 0 if Path(path).read_bytes() == b"corrupt" else 1
+
+            def close(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cached_path = Path(temp_dir) / cached_name
+            cached_path.write_bytes(b"corrupt")
+            with (
+                patch(
+                    "app.services.material.requests.get",
+                    return_value=_FakeVideoDownloadResponse(b"valid"),
+                ) as get,
+                patch("app.services.material.VideoFileClip", FakeVideoFileClip),
+                patch("app.services.material.material_upload._validate_video"),
+            ):
+                result = material.save_video(url, save_dir=temp_dir)
+
+            self.assertEqual(Path(result), cached_path)
+            self.assertEqual(cached_path.read_bytes(), b"valid")
+            get.assert_called_once()
+
+    def test_validation_service_failure_preserves_existing_cache(self):
+        """Validator outages must not turn a healthy cached asset into data loss."""
+        url = "https://example.com/signed-video.mp4?expires=soon"
+        cached_name = f"vid-{material.utils.md5(url)}.mp4"
+
+        class FakeVideoFileClip:
+            duration = 1
+            fps = 24
+
+            def __init__(self, path):
+                pass
+
+            def close(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cached_path = Path(temp_dir) / cached_name
+            cached_path.write_bytes(b"healthy cached video")
+            with (
+                patch("app.services.material.requests.get") as get,
+                patch("app.services.material.VideoFileClip", FakeVideoFileClip),
+                patch(
+                    "app.services.material.material_upload._validate_video",
+                    side_effect=material.material_upload.MaterialServiceError(
+                        "FFmpeg material validation timed out"
+                    ),
+                ),
+            ):
+                result = material.save_video(url, save_dir=temp_dir)
+
+            self.assertEqual(Path(result), cached_path)
+            self.assertEqual(cached_path.read_bytes(), b"healthy cached video")
+            get.assert_not_called()
+
+    def test_metadata_probe_failure_preserves_existing_cache(self):
+        """MoviePy failing to start FFmpeg is not evidence of corrupt media."""
+        url = "https://example.com/signed-video.mp4?expires=soon"
+        cached_name = f"vid-{material.utils.md5(url)}.mp4"
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cached_path = Path(temp_dir) / cached_name
+            cached_path.write_bytes(b"healthy cached video")
+            with (
+                patch("app.services.material.requests.get") as get,
+                patch(
+                    "app.services.material.VideoFileClip",
+                    side_effect=FileNotFoundError("MoviePy FFmpeg is unavailable"),
+                ),
+                patch(
+                    "app.services.material.material_upload._validate_video"
+                ) as validate,
+            ):
+                result = material.save_video(url, save_dir=temp_dir)
+
+            self.assertEqual(Path(result), cached_path)
+            self.assertEqual(cached_path.read_bytes(), b"healthy cached video")
+            # save_video joins with "/", Path uses "\\" on Windows: compare as paths.
+            validate.assert_called_once()
+            self.assertEqual(Path(validate.call_args.args[0]), cached_path)
+            get.assert_not_called()
+
     def test_nonfinite_video_metadata_is_not_published(self):
         class FakeVideoFileClip:
             duration = float("nan")
@@ -1201,6 +1293,68 @@ class TestMaterialTlsVerification(unittest.TestCase):
         self.assertEqual(
             [source["local_file"] for source in recorded_sources],
             ["a1.mp4", "b1.mp4", "a2.mp4"],
+        )
+
+    def test_script_order_keeps_the_slot_of_a_repeated_term(self):
+        """
+        When the script returns to a topic (forest, city, forest, mountain), the
+        repeated term gets the same search results. It must keep its own slot and
+        use the next unused candidate instead of being dropped, which would move
+        every later topic up one slot.
+        """
+
+        def fake_search(search_term, minimum_duration, video_aspect):
+            return [
+                material.MaterialInfo(
+                    provider="pexels",
+                    url=f"https://v.example/{search_term}-{n}.mp4",
+                    duration=10,
+                    source_info={
+                        "provider": "pexels",
+                        "search_term": search_term,
+                        "asset_id": f"{search_term}-{n}",
+                    },
+                )
+                for n in (1, 2, 3)
+            ]
+
+        def fake_save_video(video_url, save_dir=""):
+            return f"/tmp/{video_url.rsplit('/', 1)[-1]}"
+
+        with (
+            patch.dict(config.app, {"material_directory": ""}),
+            patch.object(material, "search_videos_pexels", side_effect=fake_search),
+            patch.object(material, "save_video", side_effect=fake_save_video),
+            patch.object(
+                material.material_cache,
+                "load_material_search_cache",
+                return_value=None,
+            ),
+            patch.object(material.material_cache, "save_material_search_cache"),
+            patch.object(
+                material.task_artifacts,
+                "patch_script_data",
+                return_value=True,
+            ),
+        ):
+            result = material.download_videos(
+                task_id="ordered-repeated-term",
+                search_terms=["forest", "city", "forest", "mountain"],
+                source="pexels",
+                audio_duration=20,
+                max_clip_duration=5,
+                match_script_order=True,
+            )
+
+        self.assertEqual(
+            result,
+            [
+                "/tmp/forest-1.mp4",
+                "/tmp/city-1.mp4",
+                "/tmp/forest-2.mp4",
+                "/tmp/mountain-1.mp4",
+                "/tmp/forest-3.mp4",
+            ],
         )
 
     def test_script_order_uses_next_candidate_after_failed_download(self):
@@ -2093,7 +2247,7 @@ class TestWaveSpeedProvider(unittest.TestCase):
         self.assertNotIn("source_page", item.source_info)
 
         self.assertIn(
-            "/api/v3/bytedance/seedance-2.0-fast/text-to-video",
+            "/api/v3/alibaba/wan-3.0/text-to-video",
             post.call_args.args[0],
         )
         self.assertEqual(
@@ -2461,8 +2615,8 @@ class TestWaveSpeedProvider(unittest.TestCase):
 
     def test_generate_wavespeed_clamps_duration_to_model_minimum(self):
         """
-        WebUI 默认片段时长 3 秒,而默认模型只接受 4-15 秒;直接透传会被 API
-        拒绝。请求必须收敛到模型下限,多出的时长由现有剪辑流程按片段时长裁掉。
+        默认模型只接受 2-30 秒;低于下限的请求直接透传会被 API 拒绝。
+        请求必须收敛到模型下限,多出的时长由现有剪辑流程按片段时长裁掉。
         """
         submit_response = self._json_response({"code": 200, "data": {"id": "pred-c1"}})
         poll_response = self._json_response(
@@ -2482,11 +2636,11 @@ class TestWaveSpeedProvider(unittest.TestCase):
             ) as post,
             patch("app.services.material.requests.get", return_value=poll_response),
         ):
-            results = material.generate_videos_wavespeed("sunrise", minimum_duration=3)
+            results = material.generate_videos_wavespeed("sunrise", minimum_duration=1)
 
-        self.assertEqual(post.call_args.kwargs["json"]["duration"], 4)
+        self.assertEqual(post.call_args.kwargs["json"]["duration"], 2)
         # MaterialInfo 记录实际生成时长,时长核算和剪辑按真实素材长度进行
-        self.assertEqual(results[0].duration, 4)
+        self.assertEqual(results[0].duration, 2)
 
     def test_generate_wavespeed_clamps_duration_to_model_maximum(self):
         """超过模型上限的请求收敛到上限,不能提交必然失败的远端请求。"""
@@ -2508,10 +2662,65 @@ class TestWaveSpeedProvider(unittest.TestCase):
             ) as post,
             patch("app.services.material.requests.get", return_value=poll_response),
         ):
-            results = material.generate_videos_wavespeed("sunrise", minimum_duration=20)
+            results = material.generate_videos_wavespeed("sunrise", minimum_duration=40)
 
-        self.assertEqual(post.call_args.kwargs["json"]["duration"], 15)
-        self.assertEqual(results[0].duration, 15)
+        self.assertEqual(post.call_args.kwargs["json"]["duration"], 30)
+        self.assertEqual(results[0].duration, 30)
+
+    def test_generate_wavespeed_default_bounds_follow_selected_model(self):
+        """
+        未配置时长区间时,默认区间按所选模型确定:默认 Wan 3.0 原样提交 3 秒;
+        显式固定 Seedance 2.0 Fast 的旧配置仍按 4-15 秒收敛;其它模型保持
+        升级前的 4-15 秒。
+        """
+        cases = [
+            (None, 3, "/api/v3/alibaba/wan-3.0/text-to-video", 3),
+            ("bytedance/seedance-2.0-fast/text-to-video", 3,
+             "/api/v3/bytedance/seedance-2.0-fast/text-to-video", 4),
+            ("bytedance/seedance-2.0-fast/text-to-video", 20,
+             "/api/v3/bytedance/seedance-2.0-fast/text-to-video", 15),
+            ("wavespeed-ai/custom-t2v", 3, "/api/v3/wavespeed-ai/custom-t2v", 4),
+        ]
+        for model, requested, expected_path, expected_duration in cases:
+            with self.subTest(model=model, requested=requested):
+                config.app.pop("wavespeed_min_duration", None)
+                config.app.pop("wavespeed_max_duration", None)
+                if model is None:
+                    config.app.pop("wavespeed_text_to_video_model", None)
+                else:
+                    config.app["wavespeed_text_to_video_model"] = model
+                submit_response = self._json_response(
+                    {"code": 200, "data": {"id": "pred-m1"}}
+                )
+                poll_response = self._json_response(
+                    {
+                        "code": 200,
+                        "data": {
+                            "id": "pred-m1",
+                            "status": "completed",
+                            "outputs": ["https://cdn.example.com/m1.mp4"],
+                        },
+                    }
+                )
+
+                with (
+                    patch(
+                        "app.services.material.requests.post",
+                        return_value=submit_response,
+                    ) as post,
+                    patch(
+                        "app.services.material.requests.get",
+                        return_value=poll_response,
+                    ),
+                ):
+                    material.generate_videos_wavespeed(
+                        "sunrise", minimum_duration=requested
+                    )
+
+                self.assertIn(expected_path, post.call_args.args[0])
+                self.assertEqual(
+                    post.call_args.kwargs["json"]["duration"], expected_duration
+                )
 
     def test_generate_wavespeed_duration_bounds_are_configurable(self):
         """切换到其它模型时,用户可以在配置中同步调整支持的时长区间。"""
@@ -2535,9 +2744,9 @@ class TestWaveSpeedProvider(unittest.TestCase):
             ) as post,
             patch("app.services.material.requests.get", return_value=poll_response),
         ):
-            material.generate_videos_wavespeed("sunrise", minimum_duration=3)
+            material.generate_videos_wavespeed("sunrise", minimum_duration=10)
 
-        self.assertEqual(post.call_args.kwargs["json"]["duration"], 3)
+        self.assertEqual(post.call_args.kwargs["json"]["duration"], 8)
 
     @staticmethod
     def _generated_item(term, url, duration=5):

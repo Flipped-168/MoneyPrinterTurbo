@@ -1,4 +1,5 @@
 import json
+import tempfile
 import threading
 import unittest
 from unittest.mock import MagicMock, patch
@@ -9,6 +10,7 @@ from app.controllers.manager.redis_manager import RedisTaskManager
 from app.models import const
 from app.models.schema import VideoParams
 from app.services import task as task_service
+from app.services.state import MemoryState
 
 
 def _queued_payload(func: str, **kwargs) -> str:
@@ -270,6 +272,7 @@ class TestRedisTaskManager(unittest.TestCase):
         )
         self.addCleanup(patcher.stop)
         from_url = patcher.start()
+        self.redis_client.eval.return_value = None
         self.manager = RedisTaskManager(
             max_concurrent_tasks=1,
             redis_url="redis://localhost:6379/0",
@@ -280,8 +283,7 @@ class TestRedisTaskManager(unittest.TestCase):
     def test_resume_queued_tasks_fills_available_slots_after_restart(self):
         """Persisted Redis entries should run without waiting for a new API request."""
         self.manager.max_concurrent_tasks = 2
-        self.redis_client.llen.return_value = 2
-        self.redis_client.lpop.side_effect = [
+        self.redis_client.eval.side_effect = [
             _queued_payload("start", task_id="first", params=_video_params()),
             _queued_payload("start", task_id="second", params=_video_params()),
         ]
@@ -291,7 +293,7 @@ class TestRedisTaskManager(unittest.TestCase):
 
         self.assertEqual(execute_task.call_count, 2)
         self.assertEqual(self.manager.current_tasks, 2)
-        self.assertEqual(self.redis_client.lpop.call_count, 2)
+        self.assertEqual(self.redis_client.eval.call_count, 2)
 
     def test_enqueue_serializes_video_params_without_mutating_task(self):
         """
@@ -335,6 +337,45 @@ class TestRedisTaskManager(unittest.TestCase):
         self.assertIs(task["func"], task_service.start)
         self.assertIsInstance(task["kwargs"]["params"], VideoParams)
         self.assertEqual(task["kwargs"]["params"].video_subject, "Coffee")
+
+    def test_video_task_queued_with_null_voice_narrates_with_the_default_voice(self):
+        """
+        A /videos task queued with "voice_name": null before the API gave such a
+        request the default voice is still in Redis with the null. It restores
+        as VideoParams, and failed at the audio stage with "'NoneType' object
+        has no attribute 'strip'".
+        """
+        params = {
+            **VideoParams(
+                video_subject="Coffee", video_script="Coffee at night."
+            ).model_dump(warnings=False),
+            "voice_name": None,
+        }
+        self.redis_client.eval.return_value = _queued_payload(
+            "start", task_id="task-1", params=params, stop_at="video"
+        )
+        with patch.object(self.manager, "execute_task") as execute_task:
+            self.manager.check_queue()
+        func, *args = execute_task.call_args.args
+
+        tts_voices = []
+
+        def record_tts(**kwargs):
+            # No audio ends the task at the audio stage, before any download.
+            tts_voices.append(kwargs["voice_name"])
+            return None
+
+        with (
+            tempfile.TemporaryDirectory() as storage_dir,
+            patch("app.utils.utils.storage_dir", return_value=storage_dir),
+            patch.object(task_service.sm, "state", MemoryState()),
+            patch.object(task_service.utils, "check_ffmpeg_ready", return_value=True),
+            patch.object(task_service, "generate_terms", return_value=["coffee"]),
+            patch.object(task_service.voice, "tts", side_effect=record_tts),
+        ):
+            func(*args, **execute_task.call_args.kwargs)
+
+        self.assertEqual(tts_voices, ["zh-CN-XiaoxiaoNeural"])
 
     def test_empty_queue_and_size_use_redis_length(self):
         """队列判空和长度必须直接反映 Redis 当前列表长度。"""
@@ -529,9 +570,10 @@ class TestRedisTaskManager(unittest.TestCase):
         可用任务，而不是把整个队列留在原地。
         """
         self.manager.current_tasks = 1
-        self.redis_client.lpop.side_effect = [
+        self.redis_client.eval.side_effect = [
             _queued_payload("retired-entry"),
             _queued_payload("start", task_id="task-next", params=_video_params()),
+            None,
         ]
 
         with patch.object(self.manager, "execute_task") as execute_task:

@@ -2,6 +2,7 @@ import asyncio
 import base64
 import io
 import inspect
+import itertools
 import json
 import math
 import os
@@ -36,6 +37,10 @@ from app.utils.subtitle_reader import moviepy_subtitles
 from app.utils.subtitle_writer import staged_subtitle_file
 
 _DEFAULT_EDGE_TTS_TIMEOUT_SECONDS = 30.0
+# 无数据超时会被每个事件重置。只持续发送字幕边界、始终不给音频的连接
+# 因此不会触发它。总时限不重置：远长于一次 8000 字脚本的正常耗时
+# （慢网络下约一分半），又不会让这种空转一直占着工作线程。
+_EDGE_TTS_TOTAL_TIMEOUT_SECONDS = 600.0
 _SILICONFLOW_TTS_TIMEOUT_SECONDS = (10, 300)  # connect, read
 _MIMO_DEFAULT_BASE_URL = "https://api.xiaomimimo.com/v1"
 _MIMO_DEFAULT_TTS_MODEL = "mimo-v2.5-tts"
@@ -637,6 +642,23 @@ def generate_silent_audio(duration_seconds: float, output_file: str) -> bool:
     return _publish_tts_ffmpeg_output(command, output_file, "silent narration encode")
 
 
+def _warn_ignored_voice_rate(provider: str, voice_rate: float) -> None:
+    """
+    Gemini TTS, MiMo TTS and VoxCPM have no numeric speed parameter, so
+    voice_rate is not sent to them. Warn when a speed other than 1.0 is
+    requested instead of ignoring it silently.
+    """
+    try:
+        ignored = float(voice_rate) != 1.0
+    except (TypeError, ValueError, OverflowError):
+        return
+    if ignored:
+        logger.warning(
+            f"{provider} does not support numeric speed adjustment; "
+            f"voice_rate {voice_rate} is ignored"
+        )
+
+
 def _single_tts(
     text: str,
     voice_name: str,
@@ -688,6 +710,7 @@ def _single_tts(
         # 格式: gemini:voice-Style；也继续兼容旧的 gemini:voice-Gender。
         voice = parse_gemini_voice_name(voice_name)
         if voice:
+            _warn_ignored_voice_rate("Gemini TTS", voice_rate)
             return gemini_tts(text, voice, voice_rate, voice_file, voice_volume)
         else:
             logger.error(f"Invalid gemini voice name format: {voice_name}")
@@ -700,6 +723,7 @@ def _single_tts(
         if len(parts) >= 2:
             voice_with_gender = parts[1]
             voice = voice_with_gender.split("-")[0]
+            _warn_ignored_voice_rate("MiMo TTS", voice_rate)
             return mimo_tts(text, voice, voice_rate, voice_file, voice_volume)
         else:
             logger.error(f"Invalid mimo voice name format: {voice_name}")
@@ -754,6 +778,7 @@ def _single_tts(
     elif is_voxcpm_voice(voice_name):
         voice_id = voice_name.split(":", 1)[1].strip()
         if voice_id:
+            _warn_ignored_voice_rate("VoxCPM", voice_rate)
             if voxcpm_reference_audio is None:
                 return voxcpm_tts(text, voice_id, voice_file, voice_rate, voice_volume)
             return voxcpm_tts(
@@ -1145,6 +1170,13 @@ def tts(
     voxcpm_prompt_audio: bytes | None = None,
     voxcpm_prompt_text: str = "",
 ) -> Union[SubMaker, None]:
+    # Emoji are not narrated: Edge TTS reads their names aloud ("chart
+    # increasing"), and each one gets its own word boundary.
+    narration = utils.remove_emoji(text)
+    if narration != text and not narration.strip():
+        logger.warning("the script has no text to narrate once emoji are removed")
+        return None
+    text = narration
     # 无停顿标签时，原样直通原始文本，避免无意义的正则处理或空白截断
     if not utils.has_pause_tags(text):
         return _single_tts(
@@ -1306,6 +1338,11 @@ def populate_legacy_submaker_with_full_text(
     return sub_maker
 
 
+# edge-tts expands short names such as en-US-AriaNeural itself, but its pattern
+# rejects a locale with a script subtag (iu-Cans-CA-SiqiniqNeural).
+_EDGE_SCRIPT_SUBTAG_VOICE = re.compile(r"^([a-z]{2,3}-[A-Z][a-z]{3}-[A-Z]{2})-(\w+Neural)$")
+
+
 def create_edge_tts_communicate(
     text: str, voice_name: str, rate_str: str
 ) -> edge_tts.Communicate:
@@ -1327,21 +1364,33 @@ def create_edge_tts_communicate(
     if "boundary" in communicate_signature.parameters:
         communicate_kwargs["boundary"] = "WordBoundary"
 
+    # Pass those voices in the full form that edge-tts sends for every voice.
+    script_subtag_voice = _EDGE_SCRIPT_SUBTAG_VOICE.match(voice_name)
+    if script_subtag_voice:
+        locale, name = script_subtag_voice.groups()
+        voice_name = f"Microsoft Server Speech Text to Speech Voice ({locale}, {name})"
+
     return edge_tts.Communicate(text, voice_name, **communicate_kwargs)
 
 
 def get_edge_tts_timeout_seconds() -> Union[float, None]:
     """
-    获取 Azure TTS V1 单次流式请求的超时时间。
+    获取 Azure TTS V1 流式请求的“无数据”超时时间。
 
     背景：
     Edge consumer TTS 在网络不通、服务端限流、voice 与文本语言不匹配等场景下，
     可能长时间卡在 `stream_sync()` 内部，日志只停留在 `start`。这里提供一个
     默认超时，避免 WebUI 任务长期无反馈。
 
+    超时按“连续多久没有收到任何事件”计算，而不是整条音频的绝对截止时间。
+    `video_script` 最长 8000 字符，慢网络下合法音频本身就可能需要一分钟以上
+    才能传完；只要数据仍在到达就必须让它完成。真正卡死的连接在超时时间内
+    没有任何事件，仍会被中止。另有 10 分钟总时限，字幕边界事件不能把它
+    往后推；只有音频也在持续到达的长脚本才会在这个上限之内读完。
+
     使用方式：
-    - 默认 30 秒，覆盖常见短视频脚本的首包等待时间；
-    - 如用户处于慢网络或代理环境，可在 `config.toml` 里设置
+    - 默认 30 秒无数据即中止，远大于常见短视频脚本的首包等待时间；
+    - 如用户处于高延迟代理环境，可在 `config.toml` 里设置
       `edge_tts_timeout = 60`；
     - 设置为 0 或负数表示显式禁用超时，保留完全向后兼容。
     """
@@ -1364,15 +1413,21 @@ def get_edge_tts_timeout_seconds() -> Union[float, None]:
 
 
 def _stream_edge_tts_sync_with_timeout(
-    communicate, on_chunk, timeout_seconds: float
+    communicate,
+    on_chunk,
+    timeout_seconds: float,
+    total_timeout_seconds: float = _EDGE_TTS_TOTAL_TIMEOUT_SECONDS,
 ) -> None:
     """
-    带总超时地消费 edge_tts 7.x 的同步流。
+    带无数据超时地消费 edge_tts 7.x 的同步流。
 
     实现原因：
     `stream_sync()` 本身是阻塞迭代器，网络层卡住时主线程无法及时恢复。
     这里把阻塞迭代放到 daemon 线程中，主线程通过 Queue 获取 chunk，
-    到达超时时间后直接抛出 TimeoutError，让外层重试和错误日志继续工作。
+    连续 `timeout_seconds` 没有收到任何事件时抛出 TimeoutError，让外层重试
+    和错误日志继续工作。每收到一个事件都会重新计时，否则长脚本在慢网络上
+    会在音频仍在正常传输时被绝对截止时间误杀。总时限不随事件重置，避免
+    只有字幕边界、没有音频的流一直占住工作线程。
 
     注意：
     直接消费 SDK 的异步流，绕过 stream_sync 内部的无界队列。队列只保留
@@ -1381,6 +1436,8 @@ def _stream_edge_tts_sync_with_timeout(
     """
     stream_queue = queue.Queue(maxsize=1)
     stopped = threading.Event()
+    # Set on the producer loop each time the consumer takes an item.
+    item_taken = asyncio.Event()
     producer_loop = None
     producer_task = None
 
@@ -1395,13 +1452,26 @@ def _stream_edge_tts_sync_with_timeout(
 
     async def _put_async(item):
         while not stopped.is_set():
+            # Clear before the put, so a take right after it still wakes us.
+            item_taken.clear()
             try:
                 stream_queue.put_nowait(item)
                 return True
             except queue.Full:
-                # Keep the loop cancellable while waiting for the consumer.
-                await asyncio.sleep(0.01)
+                # Resume as soon as the consumer takes the pending item. The
+                # timeout only re-checks `stopped`; cancellation still works.
+                try:
+                    await asyncio.wait_for(item_taken.wait(), timeout=0.05)
+                except TimeoutError:
+                    pass
         return False
+
+    def _wake_producer():
+        if producer_loop is not None:
+            try:
+                producer_loop.call_soon_threadsafe(item_taken.set)
+            except RuntimeError:
+                pass  # The producer already finished and closed its loop.
 
     async def _produce_async():
         if stopped.is_set():
@@ -1456,20 +1526,33 @@ def _stream_edge_tts_sync_with_timeout(
     thread = threading.Thread(target=_produce_chunks, daemon=True)
     thread.start()
 
-    deadline = time.monotonic() + timeout_seconds
+    started = time.monotonic()
+    idle_deadline = started + timeout_seconds
+    overall_deadline = started + total_timeout_seconds
     try:
         while True:
-            remaining_seconds = deadline - time.monotonic()
-            if remaining_seconds <= 0:
+            now = time.monotonic()
+            if now >= overall_deadline:
                 raise TimeoutError(
-                    f"edge_tts stream timed out after {timeout_seconds:g}s"
+                    f"edge_tts stream exceeded the {total_timeout_seconds:g}s "
+                    "overall limit"
                 )
+            if now >= idle_deadline:
+                raise TimeoutError(
+                    f"edge_tts stream timed out after {timeout_seconds:g}s "
+                    "without data"
+                )
+            remaining_seconds = min(idle_deadline, overall_deadline) - now
             try:
                 item_type, payload = stream_queue.get(
                     timeout=min(0.5, remaining_seconds)
                 )
             except queue.Empty:
                 continue
+            # 音频和字幕边界都说明连接仍在传输，无数据计时重新开始。
+            # 总时限不重置：持续的边界事件也不能把任务无限期挂住。
+            idle_deadline = time.monotonic() + timeout_seconds
+            _wake_producer()
             if item_type == "chunk":
                 on_chunk(payload)
             elif item_type == "error":
@@ -1486,7 +1569,10 @@ def _stream_edge_tts_sync_with_timeout(
 
 
 def stream_edge_tts_chunks(
-    communicate, on_chunk, timeout_seconds: Union[float, None] = None
+    communicate,
+    on_chunk,
+    timeout_seconds: Union[float, None] = None,
+    total_timeout_seconds: Union[float, None] = None,
 ) -> None:
     """
     统一消费 edge_tts 的同步流和旧版异步流。
@@ -1498,12 +1584,17 @@ def stream_edge_tts_chunks(
     Args:
         communicate: edge_tts.Communicate 实例
         on_chunk: 每拿到一个事件块时执行的回调
-        timeout_seconds: 单次流式请求总超时；为 None 时不启用超时。
+        timeout_seconds: 连续多久没有收到事件即中止；为 None 时不启用超时。
+            长音频整体耗时可以超过该值，只要期间仍有数据到达。
+        total_timeout_seconds: 从开始读取起的总时限，不因事件重置。
+            为 None 时使用 10 分钟默认值。仅在启用无数据超时时生效。
     """
+    if total_timeout_seconds is None:
+        total_timeout_seconds = _EDGE_TTS_TOTAL_TIMEOUT_SECONDS
     if hasattr(communicate, "stream_sync"):
         if timeout_seconds:
             _stream_edge_tts_sync_with_timeout(
-                communicate, on_chunk, timeout_seconds
+                communicate, on_chunk, timeout_seconds, total_timeout_seconds
             )
             return
 
@@ -1514,20 +1605,54 @@ def stream_edge_tts_chunks(
     if not hasattr(communicate, "stream"):
         raise AttributeError("edge_tts communicate object has no stream method")
 
-    async def _consume_async_stream():
-        async for chunk in communicate.stream():
-            on_chunk(chunk)
+    async def _consume_async_stream(idle_timeout, total_timeout):
+        started = time.monotonic()
+        stream = communicate.stream()
+        iterator = stream.__aiter__()
+        try:
+            while True:
+                now = time.monotonic()
+                if idle_timeout and now - started >= total_timeout:
+                    raise TimeoutError(
+                        f"edge_tts stream exceeded the {total_timeout:g}s "
+                        "overall limit"
+                    )
+                try:
+                    if idle_timeout:
+                        remaining_total = total_timeout - (now - started)
+                        waiting_on_overall_limit = remaining_total <= idle_timeout
+                        chunk = await asyncio.wait_for(
+                            iterator.__anext__(),
+                            timeout=min(idle_timeout, remaining_total),
+                        )
+                    else:
+                        waiting_on_overall_limit = False
+                        chunk = await iterator.__anext__()
+                except StopAsyncIteration:
+                    return
+                except TimeoutError:
+                    if waiting_on_overall_limit:
+                        raise TimeoutError(
+                            f"edge_tts stream exceeded the {total_timeout:g}s "
+                            "overall limit"
+                        ) from None
+                    raise TimeoutError(
+                        f"edge_tts stream timed out after {idle_timeout:g}s "
+                        "without data"
+                    ) from None
+                on_chunk(chunk)
+        finally:
+            close_stream = getattr(stream, "aclose", None)
+            if callable(close_stream):
+                await close_stream()
 
     # 这里显式创建独立事件循环，而不是复用外部上下文，目的是避免
     # 在同步调用栈里遇到“当前线程没有事件循环”或跨线程复用循环的问题。
     loop = asyncio.new_event_loop()
     try:
-        if timeout_seconds:
-            loop.run_until_complete(
-                asyncio.wait_for(_consume_async_stream(), timeout=timeout_seconds)
-            )
-        else:
-            loop.run_until_complete(_consume_async_stream())
+        loop.run_until_complete(
+            _consume_async_stream(timeout_seconds, total_timeout_seconds)
+        )
     finally:
         loop.close()
 
@@ -1910,6 +2035,19 @@ def azure_tts_v2(
     return None
 
 
+def _decode_gemini_tts_audio(audio_bytes: bytes):
+    from pydub import AudioSegment
+
+    audio_buffer = io.BytesIO(audio_bytes)
+    # Gemini 3.8 returns a WAV container for unary requests. Older responses
+    # may still arrive as headerless 24 kHz PCM.
+    if audio_bytes[:4] == b"RIFF" and audio_bytes[8:12] == b"WAVE":
+        return AudioSegment.from_file(audio_buffer, format="wav")
+    return AudioSegment.from_file(
+        audio_buffer, format="raw", frame_rate=24000, channels=1, sample_width=2
+    )
+
+
 def gemini_tts(
     text: str,
     voice_name: str,
@@ -1931,7 +2069,6 @@ def gemini_tts(
         SubMaker对象或None
     """
     import base64
-    import io
     from pydub import AudioSegment
     from google import genai
     from google.genai import types
@@ -1957,11 +2094,12 @@ def gemini_tts(
             ),
         )
 
-        # google-genai 使用统一 Client 调用文本和 TTS 模型。上下文管理器确保
-        # 请求结束后释放 HTTP 连接，同时保留原有 PCM 转码和字幕时间轴逻辑。
-        with genai.Client(api_key=api_key) as client:
+        # Gemini 3.8 TTS requires v1beta. Close the SDK client after the request.
+        with genai.Client(
+            api_key=api_key, http_options=types.HttpOptions(api_version="v1beta")
+        ) as client:
             response = client.models.generate_content(
-                model="gemini-2.5-flash-preview-tts",
+                model="gemini-3.8-flash-lite-tts",
                 contents=text,
                 config=generation_config,
             )
@@ -1995,20 +2133,10 @@ def gemini_tts(
             # 如果已经是字节，直接使用
             audio_bytes = audio_data
         
-        # 尝试不同的音频格式 - Gemini可能返回不同的格式
-        audio_segment = None
-        
-        # Gemini返回Linear PCM格式，按照文档参数解析
         try:
-            audio_segment = AudioSegment.from_file(
-                io.BytesIO(audio_bytes), 
-                format="raw",
-                frame_rate=24000,  # Gemini TTS默认采样率
-                channels=1,        # 单声道
-                sample_width=2     # 16-bit
-            )
+            audio_segment = _decode_gemini_tts_audio(audio_bytes)
         except Exception as e:
-            logger.error(f"Failed to load PCM audio: {e}")
+            logger.error(f"Failed to decode Gemini TTS audio: {e}")
             return None
         
         # API、CLI 或测试可以直接把尚不存在的嵌套目录作为输出位置。这里在
@@ -2019,7 +2147,7 @@ def gemini_tts(
         # pydub 会返回打开的输出文件对象。批量生成时若不主动关闭，文件描述符
         # 会持续累积，并在 Windows 上增加后续覆盖或删除音频文件失败的概率。
         if len(audio_segment) <= 0:
-            raise ValueError("Gemini returned empty PCM audio")
+            raise ValueError("Gemini returned empty audio")
         temp_fd, temporary_audio = tempfile.mkstemp(
             prefix=".gemini-tts-", suffix=".mp3",
             dir=os.path.dirname(os.path.abspath(voice_file)),
@@ -3681,6 +3809,46 @@ def _build_subtitle_items_from_legacy_submaker_words(sub_maker: SubMaker) -> lis
     return sub_items
 
 
+def _join_lines_split_inside_words(
+    text: str, script_lines: list[str], words: list[str]
+) -> list[str]:
+    """
+    Join each script line that ends inside a TTS word with the line after it.
+
+    Edge TTS returns "July 20, 1969", "Washington, D.C.", "No. 1" and
+    "Am 9. November 1989" as one word each, but the script split ends a line
+    at their comma or full stop. No run of words can match such a line, and
+    without it no subtitle file is written at all. A joined line keeps the
+    script text between its parts, as in "On July 20, 1969". Lines are only
+    joined when the words spell the script exactly, compared as in
+    _match_script_line().
+    """
+
+    def comparable(value: str) -> str:
+        return re.sub(r"[_\W]+", "", unicodedata.normalize("NFC", value))
+
+    word_texts = [comparable(unescape(word)) for word in words]
+    line_texts = [comparable(line) for line in script_lines]
+    if "".join(word_texts) != "".join(line_texts):
+        return script_lines
+
+    word_ends = set(itertools.accumulate(map(len, word_texts)))
+    line_ends = itertools.accumulate(map(len, line_texts))
+    joined_lines = []
+    start = None
+    position = 0
+    for line, line_end in zip(script_lines, line_ends):
+        # Each script line is a part of text, in order.
+        line_start = text.find(line, position)
+        position = line_start + len(line)
+        if start is None:
+            start = line_start
+        if line_end in word_ends:
+            joined_lines.append(text[start:position])
+            start = None
+    return joined_lines
+
+
 def create_subtitle(
     sub_maker: SubMaker,
     text: str,
@@ -3714,8 +3882,14 @@ def create_subtitle(
             if re.sub(r"[_\W]+", "", line)
         ]
         if hasattr(sub_maker, "cues") and sub_maker.cues:
+            script_lines = _join_lines_split_inside_words(
+                text, script_lines, [cue.content for cue in sub_maker.cues]
+            )
             sub_items = _build_subtitle_items_from_edge_cues(sub_maker, script_lines)
         else:
+            script_lines = _join_lines_split_inside_words(
+                text, script_lines, getattr(sub_maker, "subs", [])
+            )
             sub_items = _build_subtitle_items_from_legacy_submaker(
                 sub_maker, script_lines
             )
